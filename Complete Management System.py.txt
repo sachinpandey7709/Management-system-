@@ -1,0 +1,2663 @@
+"""
+
+================================================================================
+
+ MARG GOLD EDITION - Complete User Management System
+
+ Single-file GUI Application
+
+--------------------------------------------------------------------------------
+
+ Features:
+
+   - Unlimited users, unlimited granular rights
+
+   - Full CRUD + reset password + toggle active
+
+   - Rights matrix with per-cell toggle
+
+   - Audit log with CSV/JSON export
+
+   - Bulk import users (CSV / Excel) with preview & conflict strategy
+
+   - Export users (CSV / Excel multi-sheet)
+
+   - Downloadable import template
+
+   - Dark modern UI
+
+--------------------------------------------------------------------------------
+
+ Requires:
+
+   pip install openpyxl
+
+--------------------------------------------------------------------------------
+
+ Run:
+
+   python marg_gold_edition.py
+
+================================================================================
+
+"""
+
+
+
+import csv
+
+import hashlib
+
+import json
+
+import os
+
+import secrets
+
+import tkinter as tk
+
+from tkinter import ttk, messagebox, filedialog, simpledialog
+
+from datetime import datetime
+
+
+
+try:
+
+    from openpyxl import Workbook, load_workbook
+
+    from openpyxl.styles import Font, PatternFill, Alignment
+
+    from openpyxl.utils import get_column_letter
+
+    HAS_EXCEL = True
+
+except ImportError:
+
+    HAS_EXCEL = False
+
+
+
+
+
+# ============================================================================
+
+# CONSTANTS
+
+# ============================================================================
+
+DATA_FILE = "marg_users.json"
+
+RIGHTS_FILE = "marg_rights.json"
+
+AUDIT_FILE = "marg_audit.json"
+
+
+
+DEFAULT_MODULES = {
+
+    "MASTERS": ["Item", "Customer", "Supplier", "Employee", "Tax"],
+
+    "TRANSACTIONS": ["Sales", "Purchase", "Sales Return", "Purchase Return", "Payments"],
+
+    "REPORTS": ["Sales Report", "Stock Report", "Tax Report", "Ledger", "P&L"],
+
+    "ADMIN": ["User Management", "Company Settings", "Backup", "Restore", "Audit Log"],
+
+    "INVENTORY": ["Stock Entry", "Stock Transfer", "Physical Verification"],
+
+    "FINANCE": ["Journal Entry", "Bank Reconciliation", "Budget"],
+
+}
+
+RIGHT_TYPES = ["VIEW", "ADD", "EDIT", "DELETE", "PRINT", "EXPORT"]
+
+
+
+COLORS = {
+
+    "bg": "#1e1e2e",
+
+    "card": "#2a2a3e",
+
+    "accent": "#7c3aed",
+
+    "accent_hover": "#6d28d9",
+
+    "success": "#10b981",
+
+    "danger": "#ef4444",
+
+    "warning": "#f59e0b",
+
+    "text": "#e4e4e7",
+
+    "text_dim": "#a1a1aa",
+
+    "border": "#3f3f56",
+
+    "input_bg": "#181825",
+
+}
+
+
+
+
+
+# ============================================================================
+
+# BACKEND — UserManager
+
+# ============================================================================
+
+class UserManager:
+
+    def __init__(self):
+
+        self.users = {}
+
+        self.rights_matrix = {}
+
+        self.audit = []
+
+        self.load_data()
+
+
+
+    # ---------- persistence ----------
+
+    def load_data(self):
+
+        for file, attr in [(DATA_FILE, "users"),
+
+                           (RIGHTS_FILE, "rights_matrix"),
+
+                           (AUDIT_FILE, "audit")]:
+
+            if os.path.exists(file):
+
+                try:
+
+                    with open(file, "r", encoding="utf-8") as f:
+
+                        setattr(self, attr, json.load(f))
+
+                except Exception:
+
+                    pass
+
+
+
+    def save_data(self):
+
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+
+            json.dump(self.users, f, indent=2)
+
+        with open(RIGHTS_FILE, "w", encoding="utf-8") as f:
+
+            json.dump(self.rights_matrix, f, indent=2)
+
+        with open(AUDIT_FILE, "w", encoding="utf-8") as f:
+
+            json.dump(self.audit[-1000:], f, indent=2)
+
+
+
+    def log(self, actor, action, target=""):
+
+        self.audit.append({
+
+            "time": datetime.now().isoformat(timespec="seconds"),
+
+            "actor": actor, "action": action, "target": target,
+
+        })
+
+        self.save_data()
+
+
+
+    # ---------- hashing ----------
+
+    @staticmethod
+
+    def hash_password(password, salt=None):
+
+        if salt is None:
+
+            salt = secrets.token_hex(16)
+
+        h = hashlib.sha256((salt + password).encode()).hexdigest()
+
+        return f"{salt}${h}"
+
+
+
+    @staticmethod
+
+    def verify_password(password, stored):
+
+        try:
+
+            salt, hashed = stored.split("$")
+
+            return hashlib.sha256((salt + password).encode()).hexdigest() == hashed
+
+        except Exception:
+
+            return False
+
+
+
+    # ---------- CRUD ----------
+
+    def create_user(self, username, password, full_name="", role="USER", is_admin=False):
+
+        if not username or not password:
+
+            return False, "Username and password required"
+
+        if username in self.users:
+
+            return False, "User already exists"
+
+        self.users[username] = {
+
+            "username": username,
+
+            "password": self.hash_password(password),
+
+            "full_name": full_name,
+
+            "role": role,
+
+            "is_admin": is_admin,
+
+            "active": True,
+
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+
+            "last_login": None,
+
+        }
+
+        self.rights_matrix[username] = {}
+
+        if is_admin:
+
+            self.grant_all_rights(username, save=False)
+
+        self.save_data()
+
+        return True, f"User '{username}' created"
+
+
+
+    def update_user(self, username, **fields):
+
+        if username not in self.users:
+
+            return False, "User not found"
+
+        for k, v in fields.items():
+
+            if k == "password" and v:
+
+                self.users[username]["password"] = self.hash_password(v)
+
+            elif k in self.users[username] and k not in ("username", "password"):
+
+                self.users[username][k] = v
+
+        self.save_data()
+
+        return True, f"User '{username}' updated"
+
+
+
+    def delete_user(self, username):
+
+        if username not in self.users:
+
+            return False, "User not found"
+
+        del self.users[username]
+
+        self.rights_matrix.pop(username, None)
+
+        self.save_data()
+
+        return True, f"User '{username}' deleted"
+
+
+
+    def authenticate(self, username, password):
+
+        u = self.users.get(username)
+
+        if not u:
+
+            return False, "User not found"
+
+        if not u["active"]:
+
+            return False, "User is inactive"
+
+        if not self.verify_password(password, u["password"]):
+
+            return False, "Invalid password"
+
+        u["last_login"] = datetime.now().isoformat(timespec="seconds")
+
+        self.save_data()
+
+        return True, "OK"
+
+
+
+    # ---------- rights ----------
+
+    def grant_all_rights(self, username, save=True):
+
+        if username not in self.users:
+
+            return False, "User not found"
+
+        self.rights_matrix[username] = {
+
+            m: {i: list(RIGHT_TYPES) for i in items}
+
+            for m, items in DEFAULT_MODULES.items()
+
+        }
+
+        if save:
+
+            self.save_data()
+
+        return True, "All rights granted"
+
+
+
+    def revoke_all_rights(self, username):
+
+        if username not in self.users:
+
+            return False, "User not found"
+
+        self.rights_matrix[username] = {}
+
+        self.save_data()
+
+        return True, "All rights revoked"
+
+
+
+    def grant_right(self, username, module, item, right):
+
+        if username not in self.users:
+
+            return False, "User not found"
+
+        self.rights_matrix.setdefault(username, {}) \
+
+            .setdefault(module, {}).setdefault(item, [])
+
+        if right not in self.rights_matrix[username][module][item]:
+
+            self.rights_matrix[username][module][item].append(right)
+
+            self.save_data()
+
+        return True, "Granted"
+
+
+
+    def revoke_right(self, username, module, item, right):
+
+        try:
+
+            if right in self.rights_matrix[username][module][item]:
+
+                self.rights_matrix[username][module][item].remove(right)
+
+                self.save_data()
+
+                return True, "Revoked"
+
+        except KeyError:
+
+            pass
+
+        return False, "Not found"
+
+
+
+    def has_right(self, username, module, item, right):
+
+        if self.users.get(username, {}).get("is_admin"):
+
+            return True
+
+        try:
+
+            return right in self.rights_matrix[username][module][item]
+
+        except KeyError:
+
+            return False
+
+
+
+    def is_admin(self, username):
+
+        return self.users.get(username, {}).get("is_admin", False)
+
+
+
+    def count_rights(self, uname):
+
+        if self.is_admin(uname):
+
+            return sum(len(items) * len(RIGHT_TYPES)
+
+                       for items in DEFAULT_MODULES.values())
+
+        total = 0
+
+        for module in self.rights_matrix.get(uname, {}).values():
+
+            for rights in module.values():
+
+                total += len(rights)
+
+        return total
+
+
+
+
+
+# ============================================================================
+
+# IMPORT/EXPORT — helpers
+
+# ============================================================================
+
+def export_users_csv(um, path):
+
+    with open(path, "w", newline="", encoding="utf-8") as f:
+
+        writer = csv.writer(f)
+
+        writer.writerow(["username", "full_name", "role", "is_admin", "active",
+
+                         "created_at", "last_login", "total_rights"])
+
+        for uname, u in um.users.items():
+
+            writer.writerow([
+
+                uname, u["full_name"], u["role"],
+
+                "YES" if u["is_admin"] else "NO",
+
+                "YES" if u["active"] else "NO",
+
+                u["created_at"], u["last_login"] or "",
+
+                um.count_rights(uname),
+
+            ])
+
+    return True, f"Exported {len(um.users)} users to {os.path.basename(path)}"
+
+
+
+
+
+def export_users_excel(um, path):
+
+    if not HAS_EXCEL:
+
+        return False, "openpyxl not installed.\nRun: pip install openpyxl"
+
+
+
+    wb = Workbook()
+
+    hfont = Font(bold=True, color="FFFFFF", size=11)
+
+    hfill = PatternFill("solid", fgColor="7C3AED")
+
+    center = Alignment(horizontal="center", vertical="center")
+
+
+
+    # --- Sheet 1: Users ---
+
+    ws = wb.active
+
+    ws.title = "Users"
+
+    ws.append(["Username", "Full Name", "Role", "Admin", "Active",
+
+               "Created", "Last Login", "Total Rights"])
+
+    for c in ws[1]:
+
+        c.font = hfont; c.fill = hfill; c.alignment = center
+
+    for uname, u in um.users.items():
+
+        ws.append([uname, u["full_name"], u["role"],
+
+                   "YES" if u["is_admin"] else "NO",
+
+                   "YES" if u["active"] else "NO",
+
+                   u["created_at"], u["last_login"] or "—",
+
+                   um.count_rights(uname)])
+
+    _autosize(ws)
+
+
+
+    # --- Sheet 2: Rights Matrix ---
+
+    ws2 = wb.create_sheet("Rights Matrix")
+
+    ws2.append(["Username", "Module", "Item"] + RIGHT_TYPES)
+
+    for c in ws2[1]:
+
+        c.font = hfont; c.fill = hfill; c.alignment = center
+
+    for uname in um.users:
+
+        is_admin = um.is_admin(uname)
+
+        for module, items in DEFAULT_MODULES.items():
+
+            for item in items:
+
+                row = [uname, module, item]
+
+                for r in RIGHT_TYPES:
+
+                    row.append("✔" if (is_admin or um.has_right(uname, module, item, r)) else "")
+
+                ws2.append(row)
+
+    _autosize(ws2)
+
+
+
+    # --- Sheet 3: Audit Log ---
+
+    ws3 = wb.create_sheet("Audit Log")
+
+    ws3.append(["Time", "Actor", "Action", "Target"])
+
+    for c in ws3[1]:
+
+        c.font = hfont; c.fill = hfill; c.alignment = center
+
+    for e in um.audit:
+
+        ws3.append([e["time"], e["actor"], e["action"], e.get("target", "")])
+
+    _autosize(ws3)
+
+
+
+    wb.save(path)
+
+    return True, f"Exported {len(um.users)} users + rights to {os.path.basename(path)}"
+
+
+
+
+
+def export_template_csv(path):
+
+    with open(path, "w", newline="", encoding="utf-8") as f:
+
+        w = csv.writer(f)
+
+        w.writerow(["username", "password", "full_name", "role", "is_admin", "active"])
+
+        w.writerow(["john_doe", "Pass@123", "John Doe", "USER", "NO", "YES"])
+
+        w.writerow(["jane_admin", "Admin@456", "Jane Smith", "ADMIN", "YES", "YES"])
+
+        w.writerow(["cashier1", "cash123", "Rajesh Kumar", "CASHIER", "NO", "YES"])
+
+    return True, f"Template saved to {os.path.basename(path)}"
+
+
+
+
+
+def _read_file(path):
+
+    ext = path.lower().rsplit(".", 1)[-1]
+
+    if ext == "csv":
+
+        with open(path, "r", encoding="utf-8-sig") as f:
+
+            return list(csv.reader(f))
+
+    elif ext in ("xlsx", "xlsm"):
+
+        if not HAS_EXCEL:
+
+            return None
+
+        wb = load_workbook(path, read_only=True, data_only=True)
+
+        ws = wb.active
+
+        return [[str(c) if c is not None else "" for c in row]
+
+                for row in ws.iter_rows(values_only=True)]
+
+    return None
+
+
+
+
+
+def _get(row, idx):
+
+    if idx is None or idx >= len(row):
+
+        return ""
+
+    val = row[idx]
+
+    return str(val) if val is not None else ""
+
+
+
+
+
+def _parse_bool(val, default=False):
+
+    if not val:
+
+        return default
+
+    return str(val).strip().lower() in ("yes", "y", "true", "1", "✔", "x")
+
+
+
+
+
+def _autosize(ws):
+
+    for col in ws.columns:
+
+        max_len = 0
+
+        letter = get_column_letter(col[0].column)
+
+        for cell in col:
+
+            if cell.value:
+
+                max_len = max(max_len, len(str(cell.value)))
+
+        ws.column_dimensions[letter].width = min(max_len + 3, 40)
+
+
+
+
+
+def preview_import(um, path):
+
+    rows = _read_file(path)
+
+    if rows is None:
+
+        return None, "Unsupported format (use .csv or .xlsx)"
+
+    if not rows:
+
+        return None, "File is empty"
+
+
+
+    headers = [h.strip().lower() for h in rows[0]]
+
+    for req in ("username", "password"):
+
+        if req not in headers:
+
+            return None, f"Missing required column: '{req}'"
+
+
+
+    idx = {h: i for i, h in enumerate(headers)}
+
+    preview = []
+
+    for row_num, row in enumerate(rows[1:], start=2):
+
+        if not any(row):
+
+            continue
+
+        rec = {
+
+            "row": row_num,
+
+            "username": _get(row, idx.get("username")).strip(),
+
+            "password": _get(row, idx.get("password")),
+
+            "full_name": _get(row, idx.get("full_name")).strip(),
+
+            "role": _get(row, idx.get("role")).strip() or "USER",
+
+            "is_admin": _parse_bool(_get(row, idx.get("is_admin"))),
+
+            "active": _parse_bool(_get(row, idx.get("active")), default=True),
+
+        }
+
+        if not rec["username"]:
+
+            rec.update(status="invalid", reason="Missing username")
+
+        elif not rec["password"]:
+
+            rec.update(status="invalid", reason="Missing password")
+
+        elif rec["username"] in um.users:
+
+            rec.update(status="duplicate", reason="Username already exists")
+
+        else:
+
+            rec.update(status="new", reason="")
+
+        preview.append(rec)
+
+    return preview, "OK"
+
+
+
+
+
+def commit_import(um, preview, actor, conflict="skip"):
+
+    created = updated = skipped = 0
+
+    errors = []
+
+    for rec in preview:
+
+        if rec["status"] == "invalid":
+
+            skipped += 1
+
+            errors.append(f"Row {rec['row']}: {rec['reason']}")
+
+            continue
+
+        if rec["status"] == "duplicate":
+
+            if conflict == "skip":
+
+                skipped += 1
+
+                continue
+
+            ok, msg = um.update_user(
+
+                rec["username"], full_name=rec["full_name"],
+
+                role=rec["role"], is_admin=rec["is_admin"],
+
+                active=rec["active"])
+
+            if ok:
+
+                if rec["is_admin"]:
+
+                    um.grant_all_rights(rec["username"])
+
+                um.log(actor, "IMPORT_UPDATE", rec["username"])
+
+                updated += 1
+
+            else:
+
+                errors.append(f"Row {rec['row']}: {msg}")
+
+                skipped += 1
+
+        else:
+
+            ok, msg = um.create_user(rec["username"], rec["password"],
+
+                                     rec["full_name"], rec["role"], rec["is_admin"])
+
+            if ok:
+
+                if not rec["active"]:
+
+                    um.update_user(rec["username"], active=False)
+
+                um.log(actor, "IMPORT_CREATE", rec["username"])
+
+                created += 1
+
+            else:
+
+                errors.append(f"Row {rec['row']}: {msg}")
+
+                skipped += 1
+
+    um.save_data()
+
+    return created, updated, skipped, errors
+
+
+
+
+
+# ============================================================================
+
+# STYLE
+
+# ============================================================================
+
+def setup_styles(root):
+
+    s = ttk.Style(root)
+
+    s.theme_use("clam")
+
+    s.configure(".", background=COLORS["bg"], foreground=COLORS["text"],
+
+                fieldbackground=COLORS["input_bg"], borderwidth=0)
+
+    s.configure("TFrame", background=COLORS["bg"])
+
+    s.configure("Card.TFrame", background=COLORS["card"])
+
+    s.configure("TLabel", background=COLORS["bg"], foreground=COLORS["text"],
+
+                font=("Segoe UI", 10))
+
+    s.configure("Card.TLabel", background=COLORS["card"], foreground=COLORS["text"])
+
+    s.configure("Title.TLabel", background=COLORS["bg"], foreground=COLORS["text"],
+
+                font=("Segoe UI", 22, "bold"))
+
+    s.configure("Subtitle.TLabel", background=COLORS["bg"], foreground=COLORS["text_dim"],
+
+                font=("Segoe UI", 10))
+
+    s.configure("Header.TLabel", background=COLORS["card"], foreground=COLORS["accent"],
+
+                font=("Segoe UI", 14, "bold"))
+
+
+
+    s.configure("TButton", background=COLORS["card"], foreground=COLORS["text"],
+
+                borderwidth=0, focusthickness=0, padding=10, font=("Segoe UI", 10))
+
+    s.map("TButton", background=[("active", COLORS["border"])])
+
+    s.configure("Accent.TButton", background=COLORS["accent"],
+
+                foreground="white", font=("Segoe UI", 10, "bold"))
+
+    s.map("Accent.TButton", background=[("active", COLORS["accent_hover"])])
+
+    s.configure("Danger.TButton", background=COLORS["danger"], foreground="white")
+
+    s.map("Danger.TButton", background=[("active", "#dc2626")])
+
+    s.configure("Success.TButton", background=COLORS["success"], foreground="white")
+
+    s.map("Success.TButton", background=[("active", "#059669")])
+
+
+
+    s.configure("TEntry", fieldbackground=COLORS["input_bg"],
+
+                foreground=COLORS["text"], insertcolor=COLORS["text"],
+
+                padding=8, borderwidth=0)
+
+    s.configure("TCombobox", fieldbackground=COLORS["input_bg"],
+
+                background=COLORS["input_bg"], foreground=COLORS["text"],
+
+                arrowcolor=COLORS["text"], padding=6)
+
+    s.configure("Treeview", background=COLORS["card"],
+
+                fieldbackground=COLORS["card"], foreground=COLORS["text"],
+
+                borderwidth=0, rowheight=28)
+
+    s.configure("Treeview.Heading", background=COLORS["border"],
+
+                foreground=COLORS["text"], font=("Segoe UI", 10, "bold"), padding=8)
+
+    s.map("Treeview", background=[("selected", COLORS["accent"])])
+
+    s.configure("TCheckbutton", background=COLORS["card"],
+
+                foreground=COLORS["text"], font=("Segoe UI", 9))
+
+    s.map("TCheckbutton", background=[("active", COLORS["card"])])
+
+    s.configure("TRadiobutton", background=COLORS["bg"],
+
+                foreground=COLORS["text"], font=("Segoe UI", 10))
+
+    s.map("TRadiobutton", background=[("active", COLORS["bg"])])
+
+    s.configure("TSeparator", background=COLORS["border"])
+
+    return s
+
+
+
+
+
+# ============================================================================
+
+# LOGIN WINDOW
+
+# ============================================================================
+
+class LoginWindow:
+
+    def __init__(self, root, um, on_success):
+
+        self.root = root
+
+        self.um = um
+
+        self.on_success = on_success
+
+        self.root.title("Marg Gold Edition - Login")
+
+        self.root.geometry("420x520")
+
+        self.root.configure(bg=COLORS["bg"])
+
+        self.root.resizable(False, False)
+
+        self._center()
+
+        self._build()
+
+
+
+    def _center(self):
+
+        self.root.update_idletasks()
+
+        x = (self.root.winfo_screenwidth() - 420) // 2
+
+        y = (self.root.winfo_screenheight() - 520) // 2
+
+        self.root.geometry(f"420x520+{x}+{y}")
+
+
+
+    def _build(self):
+
+        for w in self.root.winfo_children():
+
+            w.destroy()
+
+        outer = ttk.Frame(self.root, padding=30)
+
+        outer.pack(fill="both", expand=True)
+
+
+
+        ttk.Label(outer, text="💎", font=("Segoe UI", 44)).pack(pady=(10, 0))
+
+        ttk.Label(outer, text="MARG GOLD", style="Title.TLabel").pack()
+
+        ttk.Label(outer, text="Complete User Management",
+
+                  style="Subtitle.TLabel").pack(pady=(0, 30))
+
+
+
+        card = ttk.Frame(outer, style="Card.TFrame", padding=25)
+
+        card.pack(fill="x")
+
+
+
+        ttk.Label(card, text="Username", style="Card.TLabel").pack(anchor="w", pady=(0, 4))
+
+        self.user_e = ttk.Entry(card, font=("Segoe UI", 11))
+
+        self.user_e.pack(fill="x", pady=(0, 14), ipady=4)
+
+
+
+        ttk.Label(card, text="Password", style="Card.TLabel").pack(anchor="w", pady=(0, 4))
+
+        self.pass_e = ttk.Entry(card, show="•", font=("Segoe UI", 11))
+
+        self.pass_e.pack(fill="x", pady=(0, 20), ipady=4)
+
+
+
+        ttk.Button(card, text="LOGIN", style="Accent.TButton",
+
+                   command=self._login).pack(fill="x", ipady=4)
+
+        ttk.Button(card, text="Exit", command=self.root.destroy) \
+
+            .pack(fill="x", pady=(8, 0), ipady=2)
+
+
+
+        self.status = ttk.Label(outer, text="", style="Subtitle.TLabel")
+
+        self.status.pack(pady=(15, 0))
+
+
+
+        self.user_e.focus()
+
+        self.root.bind("<Return>", lambda e: self._login())
+
+
+
+    def _login(self):
+
+        u = self.user_e.get().strip()
+
+        p = self.pass_e.get()
+
+        ok, msg = self.um.authenticate(u, p)
+
+        if ok:
+
+            self.um.log(u, "LOGIN")
+
+            self.on_success(u)
+
+        else:
+
+            self.status.configure(text=f"❌ {msg}")
+
+            self.pass_e.delete(0, "end")
+
+
+
+
+
+# ============================================================================
+
+# MAIN APP
+
+# ============================================================================
+
+class MargApp:
+
+    def __init__(self, root, um, current_user):
+
+        self.root = root
+
+        self.um = um
+
+        self.current_user = current_user
+
+        self.root.title(f"Marg Gold Edition — {current_user}")
+
+        self.root.geometry("1200x720")
+
+        self.root.configure(bg=COLORS["bg"])
+
+        self._center()
+
+        self._build()
+
+
+
+    def _center(self):
+
+        self.root.update_idletasks()
+
+        x = (self.root.winfo_screenwidth() - 1200) // 2
+
+        y = (self.root.winfo_screenheight() - 720) // 2
+
+        self.root.geometry(f"1200x720+{x}+{y}")
+
+
+
+    def _build(self):
+
+        for w in self.root.winfo_children():
+
+            w.destroy()
+
+
+
+        # Sidebar
+
+        sidebar = ttk.Frame(self.root, style="Card.TFrame", width=220)
+
+        sidebar.pack(side="left", fill="y")
+
+        sidebar.pack_propagate(False)
+
+
+
+        ttk.Label(sidebar, text="💎 MARG GOLD",
+
+                  style="Header.TLabel").pack(pady=(24, 4), padx=20, anchor="w")
+
+        ttk.Label(sidebar, text="Gold Edition", style="Card.TLabel",
+
+                  foreground=COLORS["text_dim"]).pack(padx=20, anchor="w")
+
+
+
+        ttk.Separator(sidebar).pack(fill="x", pady=15, padx=15)
+
+
+
+        info = self.um.users[self.current_user]
+
+        ttk.Label(sidebar, text=f"👤 {self.current_user}",
+
+                  style="Card.TLabel",
+
+                  font=("Segoe UI", 11, "bold")).pack(padx=20, anchor="w")
+
+        role_text = "Administrator" if info["is_admin"] else info["role"]
+
+        ttk.Label(sidebar, text=role_text, style="Card.TLabel",
+
+                  foreground=COLORS["warning"]).pack(padx=20, anchor="w", pady=(0, 15))
+
+
+
+        ttk.Separator(sidebar).pack(fill="x", pady=10, padx=15)
+
+
+
+        for label, cmd in [
+
+            ("🏠  Dashboard", self.show_dashboard),
+
+            ("👥  Users", self.show_users),
+
+            ("🔑  Rights", self.show_rights),
+
+            ("📜  Audit Log", self.show_audit),
+
+            ("⚙️  My Profile", self.show_profile),
+
+        ]:
+
+            tk.Button(sidebar, text=label, command=cmd,
+
+                      bg=COLORS["card"], fg=COLORS["text"],
+
+                      activebackground=COLORS["accent"],
+
+                      activeforeground="white",
+
+                      relief="flat", anchor="w", padx=20, pady=12,
+
+                      font=("Segoe UI", 10), cursor="hand2",
+
+                      borderwidth=0).pack(fill="x", padx=10, pady=2)
+
+
+
+        ttk.Separator(sidebar).pack(fill="x", pady=15, padx=15)
+
+
+
+        tk.Button(sidebar, text="🚪  Logout", command=self.logout,
+
+                  bg=COLORS["danger"], fg="white",
+
+                  activebackground="#b91c1c", activeforeground="white",
+
+                  relief="flat", anchor="w", padx=20, pady=12,
+
+                  font=("Segoe UI", 10, "bold"), cursor="hand2",
+
+                  borderwidth=0).pack(fill="x", padx=10, pady=(5, 20))
+
+
+
+        self.content = ttk.Frame(self.root)
+
+        self.content.pack(side="right", fill="both", expand=True)
+
+
+
+        self.show_dashboard()
+
+
+
+    def clear_content(self):
+
+        for w in self.content.winfo_children():
+
+            w.destroy()
+
+
+
+    # ---------- DASHBOARD ----------
+
+    def show_dashboard(self):
+
+        self.clear_content()
+
+        header = ttk.Frame(self.content, padding=(30, 25))
+
+        header.pack(fill="x")
+
+        ttk.Label(header, text="Dashboard", style="Title.TLabel").pack(anchor="w")
+
+        ttk.Label(header, text=f"Welcome back, {self.current_user}",
+
+                  style="Subtitle.TLabel").pack(anchor="w")
+
+
+
+        stats = ttk.Frame(self.content, padding=(30, 0))
+
+        stats.pack(fill="x", pady=10)
+
+
+
+        total_users = len(self.um.users)
+
+        active = sum(1 for u in self.um.users.values() if u["active"])
+
+        admins = sum(1 for u in self.um.users.values() if u["is_admin"])
+
+        total_rights = sum(
+
+            len(r) for ur in self.um.rights_matrix.values()
+
+            for m in ur.values() for r in m.values()
+
+        )
+
+        cards = [
+
+            ("👥 Total Users", total_users, COLORS["accent"]),
+
+            ("✅ Active", active, COLORS["success"]),
+
+            ("🛡 Admins", admins, COLORS["warning"]),
+
+            ("🔑 Rights", total_rights, "#06b6d4"),
+
+            ("📜 Events", len(self.um.audit), "#ec4899"),
+
+        ]
+
+        for label, val, color in cards:
+
+            c = tk.Frame(stats, bg=COLORS["card"], padx=20, pady=15,
+
+                         highlightbackground=color, highlightthickness=2)
+
+            c.pack(side="left", expand=True, fill="x", padx=5)
+
+            tk.Label(c, text=label, bg=COLORS["card"], fg=COLORS["text_dim"],
+
+                     font=("Segoe UI", 9)).pack(anchor="w")
+
+            tk.Label(c, text=str(val), bg=COLORS["card"], fg=color,
+
+                     font=("Segoe UI", 22, "bold")).pack(anchor="w")
+
+
+
+        activity = ttk.Frame(self.content, padding=30)
+
+        activity.pack(fill="both", expand=True)
+
+        ttk.Label(activity, text="Recent Activity",
+
+                  font=("Segoe UI", 13, "bold")).pack(anchor="w", pady=(10, 8))
+
+
+
+        cols = ("time", "actor", "action", "target")
+
+        tv = ttk.Treeview(activity, columns=cols, show="headings", height=10)
+
+        for c, t, w in [("time", "Time", 180), ("actor", "User", 150),
+
+                        ("action", "Action", 180), ("target", "Target", 300)]:
+
+            tv.heading(c, text=t); tv.column(c, width=w, anchor="w")
+
+        tv.pack(fill="both", expand=True)
+
+        for e in reversed(self.um.audit[-15:]):
+
+            tv.insert("", "end", values=(e["time"], e["actor"], e["action"],
+
+                                          e.get("target", "")))
+
+
+
+    # ---------- USERS ----------
+
+    def show_users(self):
+
+        self.clear_content()
+
+        header = ttk.Frame(self.content, padding=(30, 25))
+
+        header.pack(fill="x")
+
+        ttk.Label(header, text="User Management", style="Title.TLabel").pack(anchor="w")
+
+        ttk.Label(header, text="Create, edit, delete and manage unlimited users",
+
+                  style="Subtitle.TLabel").pack(anchor="w")
+
+
+
+        toolbar = ttk.Frame(self.content, padding=(30, 0))
+
+        toolbar.pack(fill="x", pady=10)
+
+
+
+        ttk.Button(toolbar, text="➕ New User", style="Accent.TButton",
+
+                   command=self.new_user).pack(side="left", padx=4)
+
+        ttk.Button(toolbar, text="✏️ Edit", command=self.edit_user).pack(side="left", padx=4)
+
+        ttk.Button(toolbar, text="🔐 Reset Password",
+
+                   command=self.reset_password).pack(side="left", padx=4)
+
+        ttk.Button(toolbar, text="🔁 Toggle", command=self.toggle_active) \
+
+            .pack(side="left", padx=4)
+
+        ttk.Button(toolbar, text="🗑 Delete", style="Danger.TButton",
+
+                   command=self.delete_user).pack(side="left", padx=4)
+
+
+
+        ttk.Separator(toolbar, orient="vertical").pack(side="left", padx=10, fill="y")
+
+        ttk.Button(toolbar, text="📤 Export",
+
+                   command=self.export_menu).pack(side="left", padx=4)
+
+        ttk.Button(toolbar, text="📥 Import",
+
+                   command=self.import_wizard).pack(side="left", padx=4)
+
+        ttk.Button(toolbar, text="📄 Template",
+
+                   command=self.download_template).pack(side="left", padx=4)
+
+
+
+        ttk.Button(toolbar, text="🔄 Refresh",
+
+                   command=self.show_users).pack(side="right", padx=4)
+
+
+
+        search = ttk.Frame(self.content, padding=(30, 0))
+
+        search.pack(fill="x", pady=(0, 10))
+
+        ttk.Label(search, text="🔍 Search:").pack(side="left")
+
+        self.search_var = tk.StringVar()
+
+        self.search_var.trace("w", lambda *a: self.refresh_user_tree())
+
+        ttk.Entry(search, textvariable=self.search_var,
+
+                  width=40).pack(side="left", padx=8, fill="x", expand=True)
+
+
+
+        tree_frame = ttk.Frame(self.content, padding=(30, 0, 30, 30))
+
+        tree_frame.pack(fill="both", expand=True)
+
+
+
+        cols = ("username", "full_name", "role", "admin", "active",
+
+                "created", "last_login")
+
+        self.user_tree = ttk.Treeview(tree_frame, columns=cols, show="headings")
+
+        for c, t, w in [("username", "Username", 150), ("full_name", "Full Name", 200),
+
+                        ("role", "Role", 120), ("admin", "Admin", 70),
+
+                        ("active", "Active", 70), ("created", "Created", 160),
+
+                        ("last_login", "Last Login", 160)]:
+
+            self.user_tree.heading(c, text=t)
+
+            self.user_tree.column(c, width=w, anchor="w")
+
+        scroll = ttk.Scrollbar(tree_frame, orient="vertical",
+
+                                command=self.user_tree.yview)
+
+        self.user_tree.configure(yscrollcommand=scroll.set)
+
+        self.user_tree.pack(side="left", fill="both", expand=True)
+
+        scroll.pack(side="right", fill="y")
+
+
+
+        self.user_tree.bind("<Double-1>", lambda e: self.edit_user())
+
+        self.refresh_user_tree()
+
+
+
+    def refresh_user_tree(self):
+
+        if not hasattr(self, "user_tree"):
+
+            return
+
+        for row in self.user_tree.get_children():
+
+            self.user_tree.delete(row)
+
+        q = self.search_var.get().lower() if hasattr(self, "search_var") else ""
+
+        for uname, u in self.um.users.items():
+
+            if q and q not in uname.lower() and q not in u["full_name"].lower():
+
+                continue
+
+            self.user_tree.insert("", "end", values=(
+
+                uname, u["full_name"], u["role"],
+
+                "✔" if u["is_admin"] else "",
+
+                "✔" if u["active"] else "✘",
+
+                u["created_at"].replace("T", " "),
+
+                (u["last_login"] or "—").replace("T", " "),
+
+            ))
+
+
+
+    def get_selected_user(self):
+
+        sel = self.user_tree.selection()
+
+        if not sel:
+
+            messagebox.showwarning("No selection", "Please select a user first")
+
+            return None
+
+        return self.user_tree.item(sel[0], "values")[0]
+
+
+
+    def new_user(self):
+
+        UserDialog(self.root, self.um, self.current_user, on_save=self.refresh_user_tree)
+
+
+
+    def edit_user(self):
+
+        uname = self.get_selected_user()
+
+        if uname:
+
+            UserDialog(self.root, self.um, self.current_user, edit_user=uname,
+
+                       on_save=self.refresh_user_tree)
+
+
+
+    def reset_password(self):
+
+        uname = self.get_selected_user()
+
+        if not uname:
+
+            return
+
+        dlg = tk.Toplevel(self.root)
+
+        dlg.title("Reset Password")
+
+        dlg.configure(bg=COLORS["bg"])
+
+        dlg.geometry("380x220")
+
+        dlg.transient(self.root)
+
+        dlg.grab_set()
+
+        ttk.Label(dlg, text=f"Reset password for {uname}",
+
+                  font=("Segoe UI", 12, "bold")).pack(pady=20)
+
+        ttk.Label(dlg, text="New password:").pack()
+
+        e = ttk.Entry(dlg, show="•", width=30)
+
+        e.pack(pady=8); e.focus()
+
+
+
+        def save():
+
+            pw = e.get()
+
+            if len(pw) < 3:
+
+                messagebox.showerror("Error", "Password too short", parent=dlg)
+
+                return
+
+            self.um.update_user(uname, password=pw)
+
+            self.um.log(self.current_user, "RESET_PASSWORD", uname)
+
+            messagebox.showinfo("Success", "Password updated", parent=dlg)
+
+            dlg.destroy()
+
+
+
+        ttk.Button(dlg, text="Save", style="Accent.TButton",
+
+                   command=save).pack(pady=10)
+
+
+
+    def toggle_active(self):
+
+        uname = self.get_selected_user()
+
+        if not uname:
+
+            return
+
+        if uname == self.current_user:
+
+            messagebox.showerror("Error", "Cannot deactivate yourself")
+
+            return
+
+        cur = self.um.users[uname]["active"]
+
+        self.um.update_user(uname, active=not cur)
+
+        self.um.log(self.current_user, "TOGGLE_ACTIVE", uname)
+
+        self.refresh_user_tree()
+
+
+
+    def delete_user(self):
+
+        uname = self.get_selected_user()
+
+        if not uname:
+
+            return
+
+        if uname == self.current_user:
+
+            messagebox.showerror("Error", "Cannot delete yourself")
+
+            return
+
+        if not messagebox.askyesno("Confirm", f"Delete user '{uname}'?"):
+
+            return
+
+        ok, msg = self.um.delete_user(uname)
+
+        self.um.log(self.current_user, "DELETE_USER", uname)
+
+        messagebox.showinfo("Result", msg)
+
+        self.refresh_user_tree()
+
+
+
+    # ---------- EXPORT ----------
+
+    def export_menu(self):
+
+        dlg = tk.Toplevel(self.root)
+
+        dlg.title("Export Users")
+
+        dlg.configure(bg=COLORS["bg"])
+
+        dlg.geometry("340x260")
+
+        dlg.transient(self.root)
+
+        dlg.grab_set()
+
+        ttk.Label(dlg, text="📤 Export Users",
+
+                  font=("Segoe UI", 14, "bold")).pack(pady=20)
+
+        ttk.Label(dlg, text="Choose a format:",
+
+                  foreground=COLORS["text_dim"]).pack()
+
+
+
+        def do_csv():
+
+            dlg.destroy()
+
+            path = filedialog.asksaveasfilename(
+
+                defaultextension=".csv",
+
+                filetypes=[("CSV", "*.csv")],
+
+                initialfile=f"marg_users_{datetime.now():%Y%m%d_%H%M}.csv")
+
+            if not path:
+
+                return
+
+            ok, msg = export_users_csv(self.um, path)
+
+            self.um.log(self.current_user, "EXPORT_USERS", "CSV")
+
+            (messagebox.showinfo if ok else messagebox.showerror)("Export", msg)
+
+
+
+        def do_excel():
+
+            dlg.destroy()
+
+            path = filedialog.asksaveasfilename(
+
+                defaultextension=".xlsx",
+
+                filetypes=[("Excel", "*.xlsx")],
+
+                initialfile=f"marg_users_{datetime.now():%Y%m%d_%H%M}.xlsx")
+
+            if not path:
+
+                return
+
+            ok, msg = export_users_excel(self.um, path)
+
+            self.um.log(self.current_user, "EXPORT_USERS", "EXCEL")
+
+            (messagebox.showinfo if ok else messagebox.showerror)("Export", msg)
+
+
+
+        ttk.Button(dlg, text="📄  Export as CSV", style="Accent.TButton",
+
+                   command=do_csv).pack(fill="x", padx=30, pady=6, ipady=4)
+
+        ttk.Button(dlg, text="📊  Export as Excel (multi-sheet)",
+
+                   command=do_excel).pack(fill="x", padx=30, pady=6, ipady=4)
+
+        ttk.Button(dlg, text="Cancel", command=dlg.destroy) \
+
+            .pack(fill="x", padx=30, pady=6)
+
+
+
+    def download_template(self):
+
+        path = filedialog.asksaveasfilename(
+
+            defaultextension=".csv", filetypes=[("CSV", "*.csv")],
+
+            initialfile="marg_import_template.csv")
+
+        if not path:
+
+            return
+
+        ok, msg = export_template_csv(path)
+
+        messagebox.showinfo("Template", msg)
+
+
+
+    # ---------- IMPORT ----------
+
+    def import_wizard(self):
+
+        path = filedialog.askopenfilename(
+
+            title="Select file to import",
+
+            filetypes=[("CSV/Excel", "*.csv *.xlsx *.xlsm"),
+
+                       ("CSV", "*.csv"), ("Excel", "*.xlsx *.xlsm")])
+
+        if not path:
+
+            return
+
+        preview, msg = preview_import(self.um, path)
+
+        if preview is None:
+
+            messagebox.showerror("Import Error", msg)
+
+            return
+
+        if not preview:
+
+            messagebox.showwarning("Import", "File is empty")
+
+            return
+
+        self._show_import_preview(preview, path)
+
+
+
+    def _show_import_preview(self, preview, path):
+
+        dlg = tk.Toplevel(self.root)
+
+        dlg.title("Import Preview")
+
+        dlg.configure(bg=COLORS["bg"])
+
+        dlg.geometry("900x620")
+
+        dlg.transient(self.root)
+
+        dlg.grab_set()
+
+
+
+        header = ttk.Frame(dlg, padding=20)
+
+        header.pack(fill="x")
+
+        ttk.Label(header, text="📥 Import Preview",
+
+                  font=("Segoe UI", 16, "bold")).pack(anchor="w")
+
+        ttk.Label(header, text=f"File: {os.path.basename(path)}",
+
+                  foreground=COLORS["text_dim"]).pack(anchor="w")
+
+
+
+        new_c = sum(1 for r in preview if r["status"] == "new")
+
+        dup_c = sum(1 for r in preview if r["status"] == "duplicate")
+
+        inv_c = sum(1 for r in preview if r["status"] == "invalid")
+
+
+
+        stats = ttk.Frame(dlg, padding=(20, 0))
+
+        stats.pack(fill="x", pady=10)
+
+        for label, val, color in [
+
+            ("🆕 New", new_c, COLORS["success"]),
+
+            ("⚠️ Duplicates", dup_c, COLORS["warning"]),
+
+            ("❌ Invalid", inv_c, COLORS["danger"]),
+
+        ]:
+
+            c = tk.Frame(stats, bg=COLORS["card"], padx=15, pady=8,
+
+                         highlightbackground=color, highlightthickness=2)
+
+            c.pack(side="left", padx=5)
+
+            tk.Label(c, text=label, bg=COLORS["card"],
+
+                     fg=COLORS["text_dim"], font=("Segoe UI", 9)).pack()
+
+            tk.Label(c, text=str(val), bg=COLORS["card"], fg=color,
+
+                     font=("Segoe UI", 16, "bold")).pack()
+
+
+
+        tree_frame = ttk.Frame(dlg, padding=(20, 0))
+
+        tree_frame.pack(fill="both", expand=True)
+
+
+
+        cols = ("row", "status", "username", "full_name", "role", "admin", "reason")
+
+        tv = ttk.Treeview(tree_frame, columns=cols, show="headings")
+
+        for c, t, w in [("row", "Row", 50), ("status", "Status", 90),
+
+                        ("username", "Username", 130), ("full_name", "Full Name", 180),
+
+                        ("role", "Role", 100), ("admin", "Admin", 70),
+
+                        ("reason", "Reason", 200)]:
+
+            tv.heading(c, text=t); tv.column(c, width=w, anchor="w")
+
+        scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=tv.yview)
+
+        tv.configure(yscrollcommand=scroll.set)
+
+        tv.pack(side="left", fill="both", expand=True)
+
+        scroll.pack(side="right", fill="y")
+
+
+
+        tv.tag_configure("new", foreground=COLORS["success"])
+
+        tv.tag_configure("duplicate", foreground=COLORS["warning"])
+
+        tv.tag_configure("invalid", foreground=COLORS["danger"])
+
+
+
+        for rec in preview:
+
+            tv.insert("", "end", values=(
+
+                rec["row"],
+
+                {"new": "🆕 New", "duplicate": "⚠️ Duplicate",
+
+                 "invalid": "❌ Invalid"}[rec["status"]],
+
+                rec["username"], rec["full_name"], rec["role"],
+
+                "✔" if rec["is_admin"] else "",
+
+                rec["reason"]), tags=(rec["status"],))
+
+
+
+        footer = ttk.Frame(dlg, padding=20)
+
+        footer.pack(fill="x")
+
+        ttk.Label(footer, text="For duplicate usernames:").pack(side="left", padx=(0, 8))
+
+        conflict = tk.StringVar(value="skip")
+
+        ttk.Radiobutton(footer, text="Skip", variable=conflict,
+
+                        value="skip").pack(side="left", padx=4)
+
+        ttk.Radiobutton(footer, text="Update existing", variable=conflict,
+
+                        value="update").pack(side="left", padx=4)
+
+
+
+        def do_import():
+
+            if new_c == 0 and (conflict.get() == "skip" or dup_c == 0):
+
+                messagebox.showinfo("Import", "Nothing to import", parent=dlg)
+
+                return
+
+            created, updated, skipped, errors = commit_import(
+
+                self.um, preview, self.current_user, conflict=conflict.get())
+
+            summary = (f"✅ Created: {created}\n"
+
+                       f"🔄 Updated: {updated}\n"
+
+                       f"⏭ Skipped: {skipped}")
+
+            if errors:
+
+                summary += f"\n\n⚠️ {len(errors)} error(s):\n" + "\n".join(errors[:10])
+
+                if len(errors) > 10:
+
+                    summary += f"\n... and {len(errors) - 10} more"
+
+            messagebox.showinfo("Import Complete", summary, parent=dlg)
+
+            self.refresh_user_tree()
+
+            self.um.log(self.current_user, "IMPORT_USERS",
+
+                        f"{created} new, {updated} updated")
+
+            dlg.destroy()
+
+
+
+        ttk.Button(footer, text="Cancel", command=dlg.destroy) \
+
+            .pack(side="right", padx=4)
+
+        ttk.Button(footer, text="✅ Import Now", style="Accent.TButton",
+
+                   command=do_import).pack(side="right", padx=4)
+
+
+
+    # ---------- RIGHTS ----------
+
+    def show_rights(self):
+
+        self.clear_content()
+
+        header = ttk.Frame(self.content, padding=(30, 25))
+
+        header.pack(fill="x")
+
+        ttk.Label(header, text="Rights Management",
+
+                  style="Title.TLabel").pack(anchor="w")
+
+        ttk.Label(header,
+
+                  text="Double-click any cell to grant / revoke a right",
+
+                  style="Subtitle.TLabel").pack(anchor="w")
+
+
+
+        top = ttk.Frame(self.content, padding=(30, 0))
+
+        top.pack(fill="x", pady=10)
+
+        ttk.Label(top, text="User:").pack(side="left")
+
+        self.rights_user = tk.StringVar(value=self.current_user)
+
+        cb = ttk.Combobox(top, textvariable=self.rights_user,
+
+                          values=list(self.um.users.keys()),
+
+                          state="readonly", width=25)
+
+        cb.pack(side="left", padx=8)
+
+        cb.bind("<<ComboboxSelected>>", lambda e: self.refresh_rights())
+
+        ttk.Button(top, text="✅ Grant All", style="Success.TButton",
+
+                   command=self.grant_all).pack(side="left", padx=4)
+
+        ttk.Button(top, text="❌ Revoke All", style="Danger.TButton",
+
+                   command=self.revoke_all).pack(side="left", padx=4)
+
+
+
+        body = ttk.Frame(self.content, padding=(30, 0, 30, 30))
+
+        body.pack(fill="both", expand=True)
+
+        cols = ("module", "item") + tuple(r.lower() for r in RIGHT_TYPES)
+
+        self.rights_tree = ttk.Treeview(body, columns=cols, show="headings")
+
+        for c, t, w in [("module", "Module", 140), ("item", "Item", 180)] + \
+
+                       [(r.lower(), r, 80) for r in RIGHT_TYPES]:
+
+            self.rights_tree.heading(c, text=t)
+
+            self.rights_tree.column(c, width=w,
+
+                                    anchor="w" if c in ("module", "item") else "center")
+
+        scroll = ttk.Scrollbar(body, orient="vertical",
+
+                                command=self.rights_tree.yview)
+
+        self.rights_tree.configure(yscrollcommand=scroll.set)
+
+        self.rights_tree.pack(side="left", fill="both", expand=True)
+
+        scroll.pack(side="right", fill="y")
+
+        self.rights_tree.bind("<Double-1>", self._toggle_right_click)
+
+        self.refresh_rights()
+
+
+
+    def refresh_rights(self):
+
+        if not hasattr(self, "rights_tree"):
+
+            return
+
+        for row in self.rights_tree.get_children():
+
+            self.rights_tree.delete(row)
+
+        uname = self.rights_user.get()
+
+        is_admin = self.um.is_admin(uname)
+
+        for module, items in DEFAULT_MODULES.items():
+
+            for item in items:
+
+                vals = [module, item]
+
+                for r in RIGHT_TYPES:
+
+                    if is_admin:
+
+                        vals.append("✔")
+
+                    else:
+
+                        vals.append("✔" if self.um.has_right(uname, module, item, r) else "")
+
+                self.rights_tree.insert("", "end", values=vals,
+
+                                        tags=(f"{module}|{item}",))
+
+
+
+    def _toggle_right_click(self, event):
+
+        uname = self.rights_user.get()
+
+        if self.um.is_admin(uname):
+
+            messagebox.showinfo("Admin", "Admin has all rights automatically")
+
+            return
+
+        row = self.rights_tree.identify_row(event.y)
+
+        col = self.rights_tree.identify_column(event.x)
+
+        if not row or not col:
+
+            return
+
+        module, item = self.rights_tree.item(row, "tags")[0].split("|")
+
+        ci = int(col.replace("#", "")) - 1
+
+        if ci < 2:
+
+            return
+
+        right = RIGHT_TYPES[ci - 2]
+
+        if self.um.has_right(uname, module, item, right):
+
+            self.um.revoke_right(uname, module, item, right)
+
+        else:
+
+            self.um.grant_right(uname, module, item, right)
+
+        self.um.log(self.current_user, "TOGGLE_RIGHT",
+
+                    f"{uname}:{module}/{item}/{right}")
+
+        self.refresh_rights()
+
+
+
+    def grant_all(self):
+
+        uname = self.rights_user.get()
+
+        self.um.grant_all_rights(uname)
+
+        self.um.log(self.current_user, "GRANT_ALL", uname)
+
+        self.refresh_rights()
+
+
+
+    def revoke_all(self):
+
+        uname = self.rights_user.get()
+
+        if uname == self.current_user:
+
+            messagebox.showerror("Error", "Cannot revoke your own rights")
+
+            return
+
+        self.um.revoke_all_rights(uname)
+
+        self.um.log(self.current_user, "REVOKE_ALL", uname)
+
+        self.refresh_rights()
+
+
+
+    # ---------- AUDIT ----------
+
+    def show_audit(self):
+
+        self.clear_content()
+
+        header = ttk.Frame(self.content, padding=(30, 25))
+
+        header.pack(fill="x")
+
+        ttk.Label(header, text="Audit Log", style="Title.TLabel").pack(anchor="w")
+
+        ttk.Label(header, text="All system events (last 1000)",
+
+                  style="Subtitle.TLabel").pack(anchor="w")
+
+
+
+        body = ttk.Frame(self.content, padding=(30, 0, 30, 30))
+
+        body.pack(fill="both", expand=True)
+
+        cols = ("time", "actor", "action", "target")
+
+        tv = ttk.Treeview(body, columns=cols, show="headings")
+
+        for c, t, w in [("time", "Time", 200), ("actor", "User", 150),
+
+                        ("action", "Action", 220), ("target", "Target", 350)]:
+
+            tv.heading(c, text=t); tv.column(c, width=w, anchor="w")
+
+        scroll = ttk.Scrollbar(body, orient="vertical", command=tv.yview)
+
+        tv.configure(yscrollcommand=scroll.set)
+
+        tv.pack(side="left", fill="both", expand=True)
+
+        scroll.pack(side="right", fill="y")
+
+        for e in reversed(self.um.audit):
+
+            tv.insert("", "end", values=(e["time"], e["actor"],
+
+                                          e["action"], e.get("target", "")))
+
+
+
+        ttk.Button(self.content, text="💾 Export Audit Log",
+
+                   command=self.export_audit).pack(pady=10)
+
+
+
+    def export_audit(self):
+
+        path = filedialog.asksaveasfilename(
+
+            defaultextension=".json",
+
+            filetypes=[("JSON", "*.json"), ("CSV", "*.csv")])
+
+        if not path:
+
+            return
+
+        try:
+
+            if path.endswith(".csv"):
+
+                with open(path, "w", newline="", encoding="utf-8") as f:
+
+                    w = csv.DictWriter(f, fieldnames=["time", "actor", "action", "target"])
+
+                    w.writeheader(); w.writerows(self.um.audit)
+
+            else:
+
+                with open(path, "w", encoding="utf-8") as f:
+
+                    json.dump(self.um.audit, f, indent=2)
+
+            messagebox.showinfo("Exported", f"Saved to:\n{path}")
+
+        except Exception as e:
+
+            messagebox.showerror("Error", str(e))
+
+
+
+    # ---------- PROFILE ----------
+
+    def show_profile(self):
+
+        self.clear_content()
+
+        header = ttk.Frame(self.content, padding=(30, 25))
+
+        header.pack(fill="x")
+
+        ttk.Label(header, text="My Profile", style="Title.TLabel").pack(anchor="w")
+
+
+
+        u = self.um.users[self.current_user]
+
+        card = tk.Frame(self.content, bg=COLORS["card"], padx=40, pady=30)
+
+        card.pack(fill="x", padx=30, pady=20)
+
+        for label, val in [
+
+            ("Username", u["username"]),
+
+            ("Full Name", u["full_name"] or "—"),
+
+            ("Role", u["role"]),
+
+            ("Administrator", "Yes" if u["is_admin"] else "No"),
+
+            ("Status", "Active" if u["active"] else "Inactive"),
+
+            ("Created", u["created_at"].replace("T", " ")),
+
+            ("Last Login", (u["last_login"] or "—").replace("T", " ")),
+
+        ]:
+
+            r = tk.Frame(card, bg=COLORS["card"]); r.pack(fill="x", pady=5)
+
+            tk.Label(r, text=label, bg=COLORS["card"], fg=COLORS["text_dim"],
+
+                     font=("Segoe UI", 10), width=18, anchor="w").pack(side="left")
+
+            tk.Label(r, text=val, bg=COLORS["card"], fg=COLORS["text"],
+
+                     font=("Segoe UI", 10, "bold"), anchor="w").pack(side="left")
+
+
+
+        ttk.Button(card, text="🔐 Change My Password", style="Accent.TButton",
+
+                   command=self.change_password).pack(pady=(20, 0), ipadx=20)
+
+
+
+    def change_password(self):
+
+        dlg = tk.Toplevel(self.root)
+
+        dlg.title("Change Password")
+
+        dlg.configure(bg=COLORS["bg"])
+
+        dlg.geometry("400x300")
+
+        dlg.transient(self.root); dlg.grab_set()
+
+        ttk.Label(dlg, text="Change Password",
+
+                  font=("Segoe UI", 14, "bold")).pack(pady=20)
+
+        ttk.Label(dlg, text="Current password:").pack()
+
+        cur = ttk.Entry(dlg, show="•", width=30); cur.pack(pady=6)
+
+        ttk.Label(dlg, text="New password:").pack()
+
+        n1 = ttk.Entry(dlg, show="•", width=30); n1.pack(pady=6)
+
+        ttk.Label(dlg, text="Confirm new password:").pack()
+
+        n2 = ttk.Entry(dlg, show="•", width=30); n2.pack(pady=6)
+
+
+
+        def save():
+
+            if not self.um.verify_password(cur.get(),
+
+                                            self.um.users[self.current_user]["password"]):
+
+                messagebox.showerror("Error", "Current password incorrect", parent=dlg)
+
+                return
+
+            if n1.get() != n2.get():
+
+                messagebox.showerror("Error", "Passwords don't match", parent=dlg)
+
+                return
+
+            if len(n1.get()) < 3:
+
+                messagebox.showerror("Error", "Password too short", parent=dlg)
+
+                return
+
+            self.um.update_user(self.current_user, password=n1.get())
+
+            self.um.log(self.current_user, "CHANGE_PASSWORD")
+
+            messagebox.showinfo("Success", "Password changed", parent=dlg)
+
+            dlg.destroy()
+
+
+
+        ttk.Button(dlg, text="Save", style="Accent.TButton",
+
+                   command=save).pack(pady=15)
+
+
+
+    def logout(self):
+
+        if messagebox.askyesno("Logout", "Are you sure?"):
+
+            self.um.log(self.current_user, "LOGOUT")
+
+            self.root.destroy()
+
+            launch()
+
+
+
+
+
+# ============================================================================
+
+# USER DIALOG (Create / Edit)
+
+# ============================================================================
+
+class UserDialog:
+
+    def __init__(self, parent, um, actor, edit_user=None, on_save=None):
+
+        self.um = um
+
+        self.actor = actor
+
+        self.edit_user = edit_user
+
+        self.on_save = on_save
+
+        self.dlg = tk.Toplevel(parent)
+
+        self.dlg.title("Edit User" if edit_user else "Create User")
+
+        self.dlg.configure(bg=COLORS["bg"])
+
+        self.dlg.geometry("460x520")
+
+        self.dlg.transient(parent); self.dlg.grab_set()
+
+        self._build()
+
+
+
+    def _build(self):
+
+        ttk.Label(self.dlg, text="Edit User" if self.edit_user else "New User",
+
+                  font=("Segoe UI", 16, "bold")).pack(pady=(20, 15))
+
+        form = ttk.Frame(self.dlg, padding=25)
+
+        form.pack(fill="both", expand=True)
+
+
+
+        def add(label, show=None):
+
+            ttk.Label(form, text=label).pack(anchor="w", pady=(8, 2))
+
+            e = ttk.Entry(form, show=show or ""); e.pack(fill="x", ipady=4)
+
+            return e
+
+
+
+        self.username_e = add("Username")
+
+        self.fullname_e = add("Full Name")
+
+        self.password_e = add("Password", show="•")
+
+        self.role_e = add("Role")
+
+
+
+        self.admin_var = tk.BooleanVar()
+
+        ttk.Checkbutton(form, text="Administrator (all rights automatically)",
+
+                        variable=self.admin_var).pack(anchor="w", pady=10)
+
+        self.active_var = tk.BooleanVar(value=True)
+
+        ttk.Checkbutton(form, text="Account Active",
+
+                        variable=self.active_var).pack(anchor="w")
+
+
+
+        if self.edit_user:
+
+            u = self.um.users[self.edit_user]
+
+            self.username_e.insert(0, u["username"])
+
+            self.username_e.configure(state="disabled")
+
+            self.fullname_e.insert(0, u["full_name"])
+
+            self.role_e.insert(0, u["role"])
+
+            self.admin_var.set(u["is_admin"])
+
+            self.active_var.set(u["active"])
+
+            self.password_e.configure(state="disabled")
+
+            ttk.Label(form, text="(password unchanged — use Reset Password)",
+
+                      foreground=COLORS["text_dim"]).pack(anchor="w")
+
+
+
+        btns = ttk.Frame(form); btns.pack(fill="x", pady=20)
+
+        ttk.Button(btns, text="Cancel",
+
+                   command=self.dlg.destroy).pack(side="right", padx=5)
+
+        ttk.Button(btns, text="💾 Save", style="Accent.TButton",
+
+                   command=self._save).pack(side="right", padx=5)
+
+
+
+    def _save(self):
+
+        uname = self.username_e.get().strip()
+
+        fullname = self.fullname_e.get().strip()
+
+        role = self.role_e.get().strip() or "USER"
+
+        is_admin = self.admin_var.get()
+
+        active = self.active_var.get()
+
+
+
+        if self.edit_user:
+
+            ok, msg = self.um.update_user(
+
+                self.edit_user, full_name=fullname, role=role,
+
+                is_admin=is_admin, active=active)
+
+            if ok and is_admin:
+
+                self.um.grant_all_rights(self.edit_user)
+
+            self.um.log(self.actor, "UPDATE_USER", self.edit_user)
+
+        else:
+
+            pw = self.password_e.get()
+
+            ok, msg = self.um.create_user(uname, pw, fullname, role, is_admin)
+
+            if ok:
+
+                self.um.log(self.actor, "CREATE_USER", uname)
+
+
+
+        if ok:
+
+            messagebox.showinfo("Success", msg)
+
+            if self.on_save:
+
+                self.on_save()
+
+            self.dlg.destroy()
+
+        else:
+
+            messagebox.showerror("Error", msg)
+
+
+
+
+
+# ============================================================================
+
+# LAUNCH
+
+# ============================================================================
+
+def launch():
+
+    um = UserManager()
+
+
+
+    # Bootstrap first admin
+
+    if not um.users:
+
+        boot = tk.Tk(); boot.withdraw()
+
+        messagebox.showinfo("First Run",
+
+                            "No users exist.\n\nPlease create the ADMIN account.")
+
+        admin_u = simpledialog.askstring("Admin Username", "Enter admin username:")
+
+        admin_p = simpledialog.askstring("Admin Password", "Enter admin password:",
+
+                                          show="•")
+
+        if admin_u and admin_p:
+
+            um.create_user(admin_u, admin_p, "System Administrator",
+
+                           role="ADMIN", is_admin=True)
+
+            um.log(admin_u, "BOOTSTRAP_ADMIN")
+
+        boot.destroy()
+
+
+
+    root = tk.Tk()
+
+    setup_styles(root)
+
+
+
+    def on_login(username):
+
+        root.destroy()
+
+        r = tk.Tk()
+
+        setup_styles(r)
+
+        MargApp(r, um, username)
+
+        r.mainloop()
+
+
+
+    LoginWindow(root, um, on_login)
+
+    root.mainloop()
+
+
+
+
+
+if __name__ == "__main__":
+
+    launch()
